@@ -1,0 +1,161 @@
+UAV Cybersecurity Pipeline Tasks
+Phase 1: Environment Setup & Data Generation
+
+1  [/] Set up Python environment and install dependencies (pymavlink, scapy, etc.)
+sudo apt update
+sudo apt install python3.12-venv python3-pip git -y
+cd "/home/thigan/Desktop/FYP PROJECT"
+python3 -m venv venv
+source venv/bin/activate
+pip install pymavlink scapy pandas numpy scikit-learn
+
+Errors were encountered while processing:
+ linux-modules-nvidia-535-6.17.0-22-generic
+ linux-modules-nvidia-535-generic-hwe-24.04
+E: Sub-process /usr/bin/dpkg returned an error code (1)
+Fix 
+sudo rm -rf /var/lib/dpkg/info/linux-modules-nvidia-535-6.17.0-22-generic.*
+sudo rm -rf /var/lib/dpkg/info/linux-modules-nvidia-535-generic-hwe-24.04.*
+sudo dpkg --configure -a
+sudo apt update
+sudo apt install -f -y
+sudo apt install python3.12-venv python3-pip git -y
+
+
+2 [ ] Install and configure ArduPilot SITL
+git clone https://github.com/ArduPilot/ardupilot.git
+cd ardupilot
+git submodule update --init --recursive
+Tools/environment_install/install-prereqs-ubuntu.sh -y
+. ~/.profile
+Error Reading state information... Done
+Note, selecting 'libfreetype-dev' instead of 'libfreetype6-dev'
+Note, selecting 'libpng16-16t64' instead of 'libpng16-16'
+E: Unable to locate package pkg-config-arm-linux-gnueabihf
+
+Fix 
+The issue was that ArduPilot's script was trying to install a package (pkg-config-arm-linux-gnueabihf) that has been completely removed in the newer Ubuntu 24.04 release, causing the whole setup to crash.
+cd /home/thigan/ardupilot
+Tools/environment_install/install-prereqs-ubuntu.sh -y
+. ~/.profile
+
+
+[ ] Write script to log normal flight telemetry (baseline data)
+[ ] Write script to simulate MAVLink injection attack
+[ ] Write script to simulate GPS spoofing attack
+
+[ ] Generate labeled CSV dataset (normal vs. attack data)
+I have just written our first major piece of code: log_telemetry.py
+I have just written our first major piece of code: log_telemetry.py. This script is designed to connect to your drone simulator, listen for the exact telemetry messages your thesis requires (GPS, Attitude, VFR_HUD, and Heartbeat), and log them into a CSV file with a clean 0 label for "Normal Flight".
+
+To generate our first baseline dataset, we need to spin up the drone simulator and run our new script!
+
+Since the simulator is interactive, you will need two separate terminals for this.
+
+Terminal 1: Start the Drone Simulator
+Open a new terminal window and run:
+
+bash
+cd /home/thigan/ardupilot/ArduCopter
+sim_vehicle.py -v ArduCopter -f quad --console --map
+Note: Since this is the very first time running it, it will compile the drone firmware code which may take 3-5 minutes. Once it's done, a map and a console window should pop up showing a virtual drone.
+
+Terminal 2: Run the Logging Script
+Once the drone map has opened in Terminal 1, go back to your original terminal (where our Python venv is located) and run the script:
+
+bash
+cd "/home/thigan/Desktop/FYP PROJECT"
+source venv/bin/activate
+python log_telemetry.py --out normal_flight_data.csv --label 0
+You should see an output saying it is waiting for a heartbeat, and then it will begin logging! You can let it run for a few minutes (e.g., let the drone sit there, or send it a simple takeoff command from the simulator console using mode guided then arm throttle then takeoff 10).
+
+When you have about 5 minutes of normal data, press Ctrl+C in Terminal 2 to save the CSV file.
+
+Let me know when you have your normal_flight_data.csv file, and we will move on to the exciting part: Writing the Cyberattacks!
+
+Error Thigan@thigan-GF63-Thin-9RCX:~$ cd /home/thigan/ardupilot/ArduCopter
+sim_vehicle.py -v ArduCopter -f quad --console --map
+sim_vehicle.py: command not found
+thigan@thigan-GF63-Thin-9RCX:~/ardupilot/ArduCopter$ 
+
+Fix 
+The command not found error happened because you opened a new terminal window, and it hasn't loaded the new ArduPilot environment variables yet.
+
+To fix this, you just need to reload your terminal's profile. Run this command in Terminal 1:
+
+bash
+source ~/.profile
+After doing that, your terminal will know where sim_vehicle.py is, and you can run the simulator command again:
+
+bash
+sim_vehicle.py -v ArduCopter -f quad --console --map
+(Alternatively, if source ~/.profile doesn't work, you can always run it using its full path: python3 /home/thigan/ardupilot/Tools/autotest/sim_vehicle.py -v ArduCopter -f quad --console --map)
+
+
+That is great news! The 7-minute compilation was a one-time process.
+
+To answer your question: If you ever close it and need to open the map and console again later, you simply run the exact same command from that folder:
+
+bash
+cd /home/thigan/ardupilot/ArduCopter
+sim_vehicle.py -v ArduCopter -f quad --console --map
+Next time you run this, it will start instantly because the code is already compiled!
+
+
+ Create the environment and install dependencies:
+
+bash
+cd "/home/thigan/Desktop/FYP PROJECT"
+python3 -m venv venv
+source venv/bin/activate
+pip install pymavlink scapy pandas numpy scikit-learn
+2. Now run the logging script! (Make sure your ArduPilot simulator map is still running in the other terminal)
+
+bash
+python3 log_telemetry.py --out normal_flight_data.csv --label 0
+You should see it say "Waiting for heartbeat..." and then it will start saving the telemetry data! Press Ctrl+C after a few minutes to stop the recording.
+
+Perfect! You now have a dataset of normal drone behavior.
+
+The next step is to create the "malicious" dataset so our Machine Learning model has something to detect. I've just written a new script called simulate_attack.py which contains two nasty MAVLink attacks:
+
+Mode Change Attack: Forces the drone to instantly abandon its mission and return to launch.
+RC Override Attack: Hijacks the physical remote control channels (forcing maximum throttle and roll) to crash the drone.
+To run this safely, we need to send the drone's telemetry to two different ports so our scripts don't fight over the connection.
+
+Step 1: Add a new connection port in the Simulator
+Go to the terminal where your drone map and console are running (Terminal 1). At the STABILIZE> prompt, type:
+
+bash
+output add 127.0.0.1:14551
+(This tells the drone to broadcast its telemetry to a second port).
+
+Step 2: Start Logging Attack Data
+Go to your second terminal (where your python environment is) and run the logging script, but this time we label it as 1 (Attack):
+
+bash
+python3 log_telemetry.py --out attack_flight_data.csv --label 1
+Step 3: Launch the Cyberattack!
+Open a third terminal window, activate your environment, and launch the RC override attack on the new port!
+
+bash
+cd "/home/thigan/Desktop/FYP PROJECT"
+source venv/bin/activate
+python3 simulate_attack.py --connect udp:127.0.0.1:14551 --attack rc_override
+Watch the drone map—you should see it spin out of control or behave erratically! Let the logging script record this chaos for a few minutes, then press Ctrl+C to save attack_flight_data.csv.
+
+Let me know when you have both CSV files!
+
+Phase 2: Detection Pipeline
+[ ] Data preprocessing (cleaning, windowing for time-series)
+.
+
+[ ] Train LSTM model
+[ ] Train baseline models (Random Forest, Isolation Forest)
+[ ] Implement 5-fold cross-validation and evaluation script
+[ ] Save trained models
+Phase 3: Live Monitoring & Integration
+[ ] Set up MQTT broker
+[ ] Write live telemetry bridge (SITL -> ML model -> MQTT)
+[ ] Develop real-time dashboard (React or Streamlit)
+[ ] Full end-to-end testing
