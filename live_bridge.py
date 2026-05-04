@@ -1,5 +1,16 @@
+"""
+=============================================================
+  UAV Live Bridge (Flask Web Dashboard)
+  Part of the UAV Cyber Defense System (MSc FYP)
+  
+  This is an alternative web-based dashboard using Flask + SocketIO.
+  It connects to ArduPilot SITL via MAVLink and runs real-time
+  5-class LSTM inference at 10Hz.
+=============================================================
+"""
 import time
 import pickle
+import collections
 import numpy as np
 import tensorflow as tf
 from pymavlink import mavutil
@@ -19,14 +30,12 @@ with open('scaler.pkl', 'rb') as f:
 
 # Global state for rolling window (Time Steps = 10)
 TIME_STEPS = 10
-rolling_window = []
-
-def get_empty_state():
-    # Returns an empty state array matching the 19 features used in training
-    return np.zeros(19)
+rolling_window = collections.deque(maxlen=TIME_STEPS)
+conf_history = collections.deque(maxlen=30)
 
 # Global vehicle reference for sending commands
 vehicle = None
+startup_time = time.time()
 
 def live_telemetry_loop():
     global vehicle
@@ -42,7 +51,10 @@ def live_telemetry_loop():
         mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
 
     TARGET_MESSAGES = ['GPS_RAW_INT', 'ATTITUDE', 'VFR_HUD', 'HEARTBEAT']
-    current_state = get_empty_state()
+    current_state = np.zeros(21)
+    last_sample_time = time.time()
+    vfr_alt = 0.0
+    home_alt = 0.0
     
     while True:
         msg = vehicle.recv_match(type=TARGET_MESSAGES, blocking=True, timeout=1.0)
@@ -51,48 +63,76 @@ def live_telemetry_loop():
             
         msg_type = msg.get_type()
         
-        # Update current state vector based on message
-        # Indices match the preprocessing step in train_models.py
+        # Update current state vector based on message (21 features)
         if msg_type == 'GPS_RAW_INT':
             current_state[0:8] = [msg.lat, msg.lon, msg.alt, msg.eph, msg.epv, msg.vel, msg.cog, msg.satellites_visible]
         elif msg_type == 'ATTITUDE':
             current_state[8:14] = [msg.roll, msg.pitch, msg.yaw, msg.rollspeed, msg.pitchspeed, msg.yawspeed]
         elif msg_type == 'VFR_HUD':
             current_state[14:19] = [msg.airspeed, msg.groundspeed, msg.heading, msg.throttle, msg.climb]
+            vfr_alt = msg.alt
+        elif msg_type == 'HEARTBEAT':
+            current_state[19:21] = [msg.custom_mode, msg.base_mode]
             
-        # Add to rolling window
+        # 10Hz Sampling
+        current_time = time.time()
+        if current_time - last_sample_time < 0.1:
+            continue
+        last_sample_time = current_time
+        
         rolling_window.append(current_state.copy())
         
-        if len(rolling_window) > TIME_STEPS:
-            rolling_window.pop(0)
-            
-        # If we have a full window, run inference
+        # Run inference
         is_attack = False
         confidence = 0.0
+        attack_type = 0
         
         if len(rolling_window) == TIME_STEPS:
-            # Scale data
             window_scaled = scaler.transform(np.array(rolling_window))
-            # Reshape to (1, time_steps, features)
-            window_reshaped = np.reshape(window_scaled, (1, TIME_STEPS, 19))
+            window_reshaped = np.reshape(window_scaled, (1, TIME_STEPS, 21))
             
-            # Predict
-            prediction = model.predict(window_reshaped, verbose=0)[0][0]
-            is_attack = bool(prediction > 0.5)
-            confidence = float(prediction)
+            pred_array = model.predict(window_reshaped, verbose=0)[0]
+            pred_class = int(np.argmax(pred_array))
+            pred_prob = float(pred_array[pred_class])
             
+            # Warmup: 60s before LSTM can trigger
+            if time.time() - startup_time < 60:
+                pred_class = 0
+            
+            raw_conf = 0.0 if pred_class == 0 else pred_prob
+            conf_history.append(raw_conf)
+            confidence = float(sum(conf_history) / len(conf_history))
+            
+            is_attack = bool(confidence > 0.9)
+            attack_type = pred_class if is_attack else 0
+            
+        # Calculate altitude
+        if home_alt == 0.0 and vfr_alt != 0:
+            home_alt = vfr_alt
+        alt = max(0.0, vfr_alt - home_alt)
+        
         # Emit data to frontend
+        attack_names = {
+            0: "NORMAL",
+            1: "RC HIJACK",
+            2: "MODE FORCING",
+            3: "GPS SPOOFING",
+            4: "PARAMETER SABOTAGE"
+        }
+        
         payload = {
-            'lat': float(current_state[0]) / 1e7 if current_state[0] != 0 else 0, # MAVLink GPS is *1e7
+            'lat': float(current_state[0]) / 1e7 if current_state[0] != 0 else 0,
             'lon': float(current_state[1]) / 1e7 if current_state[1] != 0 else 0,
-            'alt': float(current_state[2]) / 1000.0, # mm to meters
+            'alt': alt,
             'roll': float(current_state[8]),
             'pitch': float(current_state[9]),
             'yaw': float(current_state[10]),
             'speed': float(current_state[14]),
             'throttle': float(current_state[17]),
             'is_attack': is_attack,
-            'confidence': confidence
+            'confidence': confidence,
+            'attack_type': attack_type,
+            'attack_name': attack_names.get(attack_type, "UNKNOWN")
         }
         socketio.emit('telemetry_update', payload)
 
@@ -106,19 +146,18 @@ def handle_command(data):
     print(f"Received dashboard command: {action}")
     
     if action == 'TAKEOFF':
-        # Set GUIDED mode (4)
+        vehicle.mav.param_set_send(
+            vehicle.target_system, vehicle.target_component,
+            b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
         vehicle.mav.command_long_send(vehicle.target_system, vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
-        # Arm Motors (1)
         vehicle.mav.command_long_send(vehicle.target_system, vehicle.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
-        # Takeoff to 10m altitude
         vehicle.mav.command_long_send(vehicle.target_system, vehicle.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, 10)
         
     elif action == 'RTL':
-        # Set RTL mode (6)
         vehicle.mav.command_long_send(vehicle.target_system, vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6, 0, 0, 0, 0, 0)
         
     elif action == 'LAND':
-        # Set LAND mode (9)
         vehicle.mav.command_long_send(vehicle.target_system, vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9, 0, 0, 0, 0, 0)
 
 @app.route('/')

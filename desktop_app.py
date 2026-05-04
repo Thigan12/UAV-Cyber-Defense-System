@@ -1,5 +1,4 @@
 import time
-import queue
 import pickle
 import threading
 import collections
@@ -39,9 +38,14 @@ class UAVDataBridge:
         self.TIME_STEPS = 10
         self.rolling_window = collections.deque(maxlen=self.TIME_STEPS)
         self.current_state = np.zeros(19)
+        self.current_flight_mode = 0
+        self.is_connected = False
+        self.is_user_navigating = False
         self.home_alt = None
         self.target_alt = 10
         self.target_speed = 5
+        self._command_cooldown = 0  # Timestamp: ignore anomalies for 15s after user commands
+        self._startup_time = time.time()  # 30s warmup before LSTM can trigger alerts
         
         # Thread
         self.thread = threading.Thread(target=self._loop)
@@ -52,6 +56,7 @@ class UAVDataBridge:
         self.ui_callback(msg_log="Connecting to SITL on udp:127.0.0.1:14550...", log_type="system")
         self.vehicle = mavutil.mavlink_connection('udp:127.0.0.1:14550')
         self.vehicle.wait_heartbeat()
+        self.is_connected = True
         self.ui_callback(msg_log="Heartbeat received! Link established.", log_type="system")
         
         self.vehicle.mav.request_data_stream_send(
@@ -78,76 +83,148 @@ class UAVDataBridge:
             elif msg_type == 'VFR_HUD':
                 self.current_state[14:19] = [msg.airspeed, msg.groundspeed, msg.heading, msg.throttle, msg.climb]
                 self.vfr_alt = msg.alt # VFR_HUD provides highly smooth EKF altitude in meters!
+                if self.home_alt is None:
+                    self.home_alt = self.vfr_alt
+            elif msg_type == 'HEARTBEAT':
+                self.current_flight_mode = msg.custom_mode
                 
-            self.rolling_window.append(self.current_state.copy())
-            
-            is_attack = False
-            confidence = 0.0
-            if len(self.rolling_window) == self.TIME_STEPS:
-                window_scaled = self.scaler.transform(np.array(self.rolling_window))
-                window_reshaped = np.reshape(window_scaled, (1, self.TIME_STEPS, 19))
-                pred = self.model.predict(window_reshaped, verbose=0)[0][0]
+            current_time = time.time()
+            if not hasattr(self, 'last_sample_time'):
+                self.last_sample_time = current_time
                 
-                # --- AI NOISE GATE & SMOOTHING ---
-                # 1. Noise Floor: Suppress background uncertainty if drone is idling
-                if pred < 0.5:
-                    raw_conf = float(pred) * 0.1
+            if current_time - self.last_sample_time >= 0.1:
+                self.last_sample_time = current_time
+                self.rolling_window.append(self.current_state.copy())
+                
+                is_attack = False
+                confidence = 0.0
+                current_attack_type = 0
+                if len(self.rolling_window) == self.TIME_STEPS:
+                    window_scaled = self.scaler.transform(np.array(self.rolling_window))
+                    window_reshaped = np.reshape(window_scaled, (1, self.TIME_STEPS, 19))
+                    pred_array = self.model.predict(window_reshaped, verbose=0)[0]
+                    pred_class = int(np.argmax(pred_array))
+                    pred_prob = float(pred_array[pred_class])
+                    
+                    # --- AI NOISE GATE & SMOOTHING ---
+                    original_class = pred_class  # Save for debug log
+                    gate_reason = "ACTIVE"
+                    
+                    # 0. Altitude Gate: Only detect attacks when airborne (>1m)
+                    current_alt = max(0.0, self.vfr_alt - self.home_alt) if self.home_alt is not None else 0
+                    if current_alt < 1.0:
+                        pred_class = 0
+                        gate_reason = "GROUNDED"
+                    
+                    # 1. Warmup: The LSTM needs time to stabilize after app launch (90s)
+                    elif time.time() - self._startup_time < 90:
+                        pred_class = 0
+                        gate_reason = "WARMUP"
+                    
+                    # 2. Command Cooldown: Ignore anomalies for 30s after user commands
+                    elif time.time() < self._command_cooldown:
+                        pred_class = 0
+                        gate_reason = "COOLDOWN"
+                    
+                    if pred_class == 0:
+                        raw_conf = 0.0
+                    else:
+                        raw_conf = pred_prob
+                    
+                    # 3. Rolling Average (last 50 predictions) for heavy smoothing
+                    if not hasattr(self, 'conf_history'):
+                        self.conf_history = collections.deque(maxlen=50)
+                    self.conf_history.append(raw_conf)
+                    
+                    confidence = float(sum(self.conf_history) / len(self.conf_history))
+                    
+                    # 4. Final Threshold: Must be very high (0.95) to trigger
+                    is_attack = bool(confidence > 0.95)
+                    current_attack_type = pred_class if is_attack else 0
+                    
+                    # --- DEBUG LOG ---
+                    if not hasattr(self, '_debug_log'):
+                        self._debug_log = open('ai_debug.log', 'w')
+                        self._debug_log.write("time,gate,raw_class,raw_prob,smoothed_conf,triggered,alt,speed,probs\n")
+                    
+                    class_names = {0:"Normal", 1:"RC_Hijack", 2:"Mode_Force", 3:"GPS_Spoof", 4:"Disarm"}
+                    probs_str = " ".join([f"{class_names.get(i,'?')}={pred_array[i]:.3f}" for i in range(len(pred_array))])
+                    current_alt_dbg = max(0.0, self.vfr_alt - self.home_alt) if self.home_alt is not None else 0
+                    self._debug_log.write(
+                        f"{time.strftime('%H:%M:%S')},"
+                        f"{gate_reason},"
+                        f"{class_names.get(original_class,'?')},"
+                        f"{pred_prob:.4f},"
+                        f"{confidence:.4f},"
+                        f"{'ATTACK' if is_attack else 'ok'},"
+                        f"{current_alt_dbg:.1f},"
+                        f"{self.current_state[14]:.2f},"
+                        f"{probs_str}\n"
+                    )
+                    self._debug_log.flush()
+                    
+                # Emit telemetry to UI (Updated at 10Hz along with AI)
+                lat = float(self.current_state[0]) / 1e7 if self.current_state[0] != 0 else 0
+                lon = float(self.current_state[1]) / 1e7 if self.current_state[1] != 0 else 0
+                
+                # Use VFR_HUD smoothed altitude for the Graph, not raw GPS
+                if self.home_alt is not None:
+                    alt = max(0.0, self.vfr_alt - self.home_alt)
                 else:
-                    raw_conf = float(pred)
+                    alt = 0.0
+                    
+                spd = float(self.current_state[14])
                 
-                # 2. Rolling Average (last 5 predictions) to stop UI jitter
-                if not hasattr(self, 'conf_history'):
-                    self.conf_history = collections.deque(maxlen=5)
-                self.conf_history.append(raw_conf)
-                
-                confidence = float(sum(self.conf_history) / len(self.conf_history))
-                
-                # 3. Trigger red alert only if smoothed confidence breaks 55%
-                is_attack = bool(confidence > 0.55)
-                
-            # Emit telemetry to UI
-            lat = float(self.current_state[0]) / 1e7 if self.current_state[0] != 0 else 0
-            lon = float(self.current_state[1]) / 1e7 if self.current_state[1] != 0 else 0
-            
-            # Use VFR_HUD smoothed altitude for the Graph, not raw GPS
-            if self.home_alt is None and self.vfr_alt != 0:
-                self.home_alt = self.vfr_alt
-                
-            alt = self.vfr_alt
-            if self.home_alt is not None:
-                alt = max(0.0, self.vfr_alt - self.home_alt)
-                
-            spd = float(self.current_state[14])
-            
-            self.ui_callback(telemetry=(lat, lon, alt, spd, is_attack, confidence))
+                self.ui_callback(telemetry=(lat, lon, alt, spd, is_attack, confidence, current_attack_type))
 
-    def trigger_mitigation(self):
+    def reset_alert(self):
+        """Operator override: clear the attack lockout so buttons work again."""
+        self.is_compromised = False
+        if hasattr(self, 'conf_history'):
+            self.conf_history.clear()
+        self.ui_callback(msg_log="[OPERATOR] Alert Cleared. System controls restored.", log_type="system")
+    
+    def trigger_mitigation(self, attack_type=1):
         if self.is_compromised or not self.vehicle: return
         self.is_compromised = True
         def _mitigate():
-            self.ui_callback(msg_log="⚠ UNAUTHORIZED MAVLINK INJECTION SUSPECTED", log_type="alert")
+            self.ui_callback(msg_log="⚠ UNAUTHORIZED MAVLINK INJECTION DETECTED", log_type="alert")
             time.sleep(0.5)
-            self.ui_callback(msg_log="[SYSTEM] INITIATING ZERO-TRUST PROTOCOL...", log_type="alert")
-            time.sleep(0.5)
-            
-            self.ui_callback(msg_log="[SYSTEM] Disabling external RC Overrides...", log_type="alert")
-            self.vehicle.mav.param_set_send(
-                self.vehicle.target_system, self.vehicle.target_component,
-                b'RC_OVERRIDE_TIME', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-            )
+            self.ui_callback(msg_log="[SYSTEM] INITIATING SMART ZERO-TRUST PROTOCOL...", log_type="alert")
             time.sleep(0.5)
             
-            self.ui_callback(msg_log="[SYSTEM] Locking manual flight controls...", log_type="alert")
-            time.sleep(0.5)
+            if attack_type == 1:
+                self.ui_callback(msg_log="[DEFENSE] RC Hijack detected. Disabling RC Overrides...", log_type="alert")
+                self.vehicle.mav.param_set_send(self.vehicle.target_system, self.vehicle.target_component, b'RC_OVERRIDE_TIME', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.5)
+                self.ui_callback(msg_log="[DEFENSE] Forcing GUIDED mode hover.", log_type="alert")
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
+                
+            elif attack_type == 2:
+                self.ui_callback(msg_log="[DEFENSE] Mode Sabotage detected. Locking mode to STABILIZE.", log_type="alert")
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0, 0, 0, 0, 0, 0)
+                
+            elif attack_type == 3:
+                self.ui_callback(msg_log="[DEFENSE] GPS Spoofing detected. Ignoring GPS.", log_type="alert")
+                self.ui_callback(msg_log="[DEFENSE] Forcing Emergency LAND mode.", log_type="alert")
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9, 0, 0, 0, 0, 0)
+                
+            elif attack_type == 4:
+                self.ui_callback(msg_log="[DEFENSE] Sabotage detected. Restoring RTL_ALT parameter...", log_type="alert")
+                self.vehicle.mav.param_set_send(self.vehicle.target_system, self.vehicle.target_component, b'RTL_ALT', 1500, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.5)
+                self.ui_callback(msg_log="[DEFENSE] Attempting mid-air motor re-arm...", log_type="alert")
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
+                time.sleep(0.5)
+                self.ui_callback(msg_log="[DEFENSE] Executing RTL to base.", log_type="alert")
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6, 0, 0, 0, 0, 0)
             
-            self.ui_callback(msg_log="[SYSTEM] Forcing Autonomous Return to Launch (RTL) mode.", log_type="alert")
-            self.vehicle.mav.command_long_send(
-                self.vehicle.target_system, self.vehicle.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6, 0, 0, 0, 0, 0
-            )
+            else:
+                self.ui_callback(msg_log="[DEFENSE] Generic Anomaly. Forcing RTL mode.", log_type="alert")
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6, 0, 0, 0, 0, 0)
+            
             time.sleep(0.5)
-            self.ui_callback(msg_log="[SYSTEM] Evading threat zone. Returning to Base...", log_type="alert")
+            self.ui_callback(msg_log="[SYSTEM] Defense protocol executed. Awaiting operator reset.", log_type="alert")
         
         threading.Thread(target=_mitigate, daemon=True).start()
 
@@ -156,15 +233,30 @@ class UAVDataBridge:
         
         if action == 'TAKEOFF':
             def _takeoff():
+                self._command_cooldown = time.time() + 30  # Suppress false positives for 30s
                 self.ui_callback(msg_log=f"[COMMAND] ARM & TAKEOFF Sequence Initiated...", log_type="system")
-                # 1. Set to GUIDED
+                # 0. Wait for GPS
+                self.ui_callback(msg_log=f"[SYSTEM] Waiting for GPS 3D Fix...", log_type="system")
+                for _ in range(60):
+                    if float(self.current_state[0]) != 0: # Check if we have valid latitude
+                        break
+                    time.sleep(1.0)
+                
+                # 1. Set to GUIDED and Disable Arming Checks
+                self.vehicle.mav.param_set_send(
+                    self.vehicle.target_system, self.vehicle.target_component,
+                    b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+                )
+                time.sleep(0.5)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
-                self.ui_callback(msg_log=f"[SYSTEM] Mode: GUIDED. Pre-Flight Checks...", log_type="system")
-                time.sleep(1.0)
+                self.ui_callback(msg_log=f"[SYSTEM] Mode: GUIDED. Pre-Flight Checks Bypassed.", log_type="system")
+                time.sleep(2.0)
+                
                 # 2. Arm
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
                 self.ui_callback(msg_log=f"[SYSTEM] Engaging Engines. Motors Armed.", log_type="system")
-                time.sleep(2.0) # MUST wait for motors to fully spool up!
+                time.sleep(3.0) # MUST wait for motors to fully spool up!
+                
                 # 3. Takeoff
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, float(self.target_alt))
                 self.ui_callback(msg_log=f"[SYSTEM] Thrust Applied. Target Altitude set to {self.target_alt}m.", log_type="system")
@@ -173,8 +265,9 @@ class UAVDataBridge:
                 
                 # Check altitude until safe
                 success = False
-                for _ in range(20):
-                    if self.vfr_alt - self.home_alt >= (self.target_alt - 1.0):
+                for _ in range(25):
+                    rel_alt = self.vfr_alt - self.home_alt if self.home_alt else 0
+                    if rel_alt >= (self.target_alt - 2.0):
                         success = True
                         break
                     time.sleep(1.0)
@@ -188,6 +281,7 @@ class UAVDataBridge:
             
         elif action == 'RTL':
             def _rtl():
+                self._command_cooldown = time.time() + 30
                 self.ui_callback(msg_log=f"[COMMAND] RETURN TO LAUNCH (RTL) INITIATED...", log_type="system")
                 time.sleep(0.5)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6, 0, 0, 0, 0, 0)
@@ -200,6 +294,7 @@ class UAVDataBridge:
             
         elif action == 'LAND':
             def _land():
+                self._command_cooldown = time.time() + 30
                 self.ui_callback(msg_log=f"[COMMAND] EMERGENCY LAND OVERRIDE INITIATED!", log_type="system")
                 time.sleep(0.5)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9, 0, 0, 0, 0, 0)
@@ -220,6 +315,7 @@ class UAVDataBridge:
 
     def change_speed(self, delta):
         if not self.vehicle or self.is_compromised: return
+        self._command_cooldown = time.time() + 30
         self.target_speed = max(1, self.target_speed + delta)
         self.ui_callback(msg_log=f"[COMMAND] Target Speed adjusted to {self.target_speed} m/s", log_type="system")
         self.vehicle.mav.command_long_send(
@@ -230,6 +326,7 @@ class UAVDataBridge:
         
     def change_alt(self, delta):
         if not self.vehicle or self.is_compromised: return
+        self._command_cooldown = time.time() + 30
         self.target_alt = max(2, self.target_alt + delta)
         self.ui_callback(msg_log=f"[COMMAND] Target Altitude adjusted to {self.target_alt} m", log_type="system")
         self.vehicle.mav.command_long_send(
@@ -242,6 +339,7 @@ class UAVDataBridge:
         if not self.vehicle or self.is_compromised: return
         
         def _fly():
+            self._command_cooldown = time.time() + 30  # Suppress false positives for 30s
             self.ui_callback(msg_log=f"[COMMAND] Target Coordinates Received: {lat:.5f}, {lon:.5f}", log_type="system")
             time.sleep(0.5)
             self.ui_callback(msg_log=f"[SYSTEM] Calculating optimal vector path...", log_type="system")
@@ -253,10 +351,21 @@ class UAVDataBridge:
             # 1. If on the ground, we MUST takeoff first
             if current_alt < 2.0:
                 self.ui_callback(msg_log=f"[SYSTEM] Drone grounded. Auto-Takeoff sequence required.", log_type="system")
+                self.ui_callback(msg_log=f"[SYSTEM] Waiting for GPS 3D Fix...", log_type="system")
+                for _ in range(60):
+                    if float(self.current_state[0]) != 0:
+                        break
+                    time.sleep(1.0)
+                    
+                self.vehicle.mav.param_set_send(
+                    self.vehicle.target_system, self.vehicle.target_component,
+                    b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+                )
+                time.sleep(0.5)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
-                time.sleep(1.0)
-                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
                 time.sleep(2.0)
+                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
+                time.sleep(3.0)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, float(self.target_alt))
                 
                 # Wait until drone actually gets into the air (at least 3 meters)
@@ -319,6 +428,7 @@ class CyberDefenseApp(ctk.CTk):
         self.drone_marker = None
         self.target_marker = None
         self.target_polygon = None
+        self._attack_logged = False
         
         # Load Custom Drone Icon
         self.drone_icon_img = ImageTk.PhotoImage(Image.open("drone_icon_safe.png").resize((50, 50)))
@@ -343,6 +453,26 @@ class CyberDefenseApp(ctk.CTk):
         
         # Interactive Click-to-Fly Feature
         self.map_widget.add_right_click_menu_command(label="Fly to Coordinate", command=self.set_target_waypoint, pass_coords=True)
+        self.map_widget.add_right_click_menu_command(label="Set Base Station", command=self.set_base_station, pass_coords=True)
+        
+        # Locate UAV button
+        self.btn_locate = ctk.CTkButton(self.map_frame, text="⌖ Locate UAV", width=120, fg_color="#334155", hover_color="#475569", command=self.locate_uav)
+        self.btn_locate.pack(pady=5)
+
+    def set_base_station(self, coords):
+        lat, lon = coords
+        self.home_location = (lat, lon)
+        self.update_terminal(f"[SYSTEM] Base Station manually updated to {lat:.5f}, {lon:.5f}", "system")
+        if not hasattr(self, 'base_marker'):
+            self.base_marker = self.map_widget.set_marker(lat, lon, text="BASE", marker_color_circle=NEON_CYAN, marker_color_outside="#0284c7")
+        else:
+            self.base_marker.set_position(lat, lon)
+            
+    def locate_uav(self):
+        if self.drone_marker:
+            pos = self.drone_marker.position
+            self.map_widget.set_position(pos[0], pos[1])
+            self.map_widget.set_zoom(18)
 
     def set_target_waypoint(self, coords):
         lat, lon = coords
@@ -362,7 +492,11 @@ class CyberDefenseApp(ctk.CTk):
         
         # 1. Status Banner
         self.status_banner = ctk.CTkLabel(self.info_frame, text="SYSTEM SECURE", font=ctk.CTkFont(size=24, weight="bold"), text_color=SAFE_GREEN, fg_color="#000000", corner_radius=5)
-        self.status_banner.pack(fill="x", padx=10, pady=10)
+        self.status_banner.pack(fill="x", padx=10, pady=(10, 2))
+        
+        # Sub-status (Connection / Flight Mode)
+        self.sub_status = ctk.CTkLabel(self.info_frame, text="CONN: OFFLINE | MODE: UNKNOWN", font=ctk.CTkFont(size=12, weight="bold"), text_color="#94a3b8")
+        self.sub_status.pack(fill="x", padx=10, pady=(0, 10))
         
         # 2. Live Graphs (Matplotlib)
         self.fig = Figure(figsize=(5, 3), dpi=100, facecolor=PANEL_BG)
@@ -402,23 +536,17 @@ class CyberDefenseApp(ctk.CTk):
         self.btn_rtl = ctk.CTkButton(ctrl_frame, text="INITIATE RTL", fg_color=BG_DARK, border_color=SAFE_GREEN, border_width=2, text_color=SAFE_GREEN, hover_color="#005533", command=lambda: self.bridge.send_command('RTL'))
         self.btn_rtl.pack(fill="x", pady=5)
         self.btn_land = ctk.CTkButton(ctrl_frame, text="EMERGENCY LAND", fg_color=NEON_RED, hover_color="#880000", text_color="#ffffff", command=lambda: self.bridge.send_command('LAND'))
-        self.btn_land.pack(fill="x", pady=(5, 10))
+        self.btn_land.pack(fill="x", pady=(5, 5))
+        self.btn_reset = ctk.CTkButton(ctrl_frame, text="⟳ RESET ALERT", fg_color="#FF8C00", hover_color="#CC7000", text_color="#ffffff", command=self.reset_system)
+        self.btn_reset.pack(fill="x", pady=(0, 10))
         
-        # Flight Adjustment Panel
-        adj_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
-        adj_frame.pack(fill="x")
-        
-        # Altitude controls
-        alt_frame = ctk.CTkFrame(adj_frame, fg_color="transparent")
-        alt_frame.pack(side="left", expand=True, fill="x", padx=2)
-        ctk.CTkButton(alt_frame, text="Alt +5m", height=24, fg_color="#334155", command=lambda: self.bridge.change_alt(5)).pack(fill="x", pady=2)
-        ctk.CTkButton(alt_frame, text="Alt -5m", height=24, fg_color="#334155", command=lambda: self.bridge.change_alt(-5)).pack(fill="x", pady=2)
-        
-        # Speed controls
-        spd_frame = ctk.CTkFrame(adj_frame, fg_color="transparent")
-        spd_frame.pack(side="right", expand=True, fill="x", padx=2)
-        ctk.CTkButton(spd_frame, text="Spd +2m/s", height=24, fg_color="#334155", command=lambda: self.bridge.change_speed(2)).pack(fill="x", pady=2)
-        ctk.CTkButton(spd_frame, text="Spd -2m/s", height=24, fg_color="#334155", command=lambda: self.bridge.change_speed(-2)).pack(fill="x", pady=2)
+        # Flight Adjustment Panel -> Replaced by Attack History
+        hist_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        hist_frame.pack(fill="x", pady=(5,0))
+        self.history_box = ctk.CTkTextbox(hist_frame, height=80, fg_color="#1e293b", text_color="#94a3b8", font=ctk.CTkFont(family="Courier", size=10))
+        self.history_box.pack(fill="x")
+        self.history_box.insert("0.0", "--- ATTACK HISTORY ---\n")
+        self.history_box.configure(state="disabled")
 
         # NOW pack canvas last, so it takes whatever space is left over
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=5)
@@ -459,27 +587,72 @@ class CyberDefenseApp(ctk.CTk):
             self.after(0, self.update_telemetry, *telemetry)
 
     def update_terminal(self, msg, log_type):
+        MAX_LINES = 500
         if log_type == "packet":
             self.term_text_left.insert("end", msg + "\n")
+            # Delete oldest lines if over the limit
+            line_count = int(self.term_text_left.index("end-1c").split(".")[0])
+            if line_count > MAX_LINES:
+                self.term_text_left.delete("1.0", f"{line_count - MAX_LINES}.0")
             self.term_text_left.see("end")
         else:
             # Add timestamp to system and alert logs
             t = time.strftime("%H:%M:%S")
             self.term_text_right.insert("end", f"[{t}] {msg}\n")
+            # Delete oldest lines if over the limit
+            line_count = int(self.term_text_right.index("end-1c").split(".")[0])
+            if line_count > MAX_LINES:
+                self.term_text_right.delete("1.0", f"{line_count - MAX_LINES}.0")
             self.term_text_right.see("end")
 
-    def update_telemetry(self, lat, lon, alt, spd, is_attack, confidence):
+    def reset_system(self):
+        """Operator override: reset the system back to normal after an attack."""
+        self.bridge.reset_alert()
+        self.bridge._command_cooldown = time.time() + 30  # Cooldown after reset
+        self._attack_logged = False
+        self.status_banner.configure(text="SYSTEM SECURE — LSTM MONITORING ACTIVE", text_color=SAFE_GREEN)
+        self.map_frame.configure(border_color=NEON_CYAN)
+        self.btn_takeoff.configure(state="normal", text="ARM & TAKEOFF")
+        self.term_text_left.configure(text_color=SAFE_GREEN)
+        self.term_text_right.configure(text_color=NEON_CYAN)
+    
+    def update_telemetry(self, lat, lon, alt, spd, is_attack, confidence, attack_type=0):
+        # Match the 60s warmup from the bridge
+        if time.time() - self.start_time < 60:
+            is_attack = False
+            confidence = 0.0
+            attack_type = 0
+
         current_color = NEON_RED if is_attack else SAFE_GREEN
+        
+        conn_str = "ONLINE" if self.bridge.is_connected else "OFFLINE"
+        mode_names = {0:"STABILIZE", 1:"ACRO", 2:"ALT_HOLD", 3:"AUTO", 4:"GUIDED", 5:"LOITER", 6:"RTL", 7:"CIRCLE", 9:"LAND", 16:"POSHOLD"}
+        mode_str = mode_names.get(self.bridge.current_flight_mode, f"UNKNOWN ({self.bridge.current_flight_mode})")
+        self.sub_status.configure(text=f"CONN: {conn_str} | MODE: {mode_str}")
         
         # 1. Update Gauge & Banner
         self.draw_gauge(confidence, current_color)
         if is_attack:
-            self.status_banner.configure(text="⚠ ATTACK DETECTED: LSTM ANOMALY", text_color=NEON_RED, border_color=NEON_RED, border_width=2)
+            attack_names = {
+                1: "RC HIJACK / CRASH OVERRIDE",
+                2: "UNAUTHORIZED MODE FORCING",
+                3: "GPS SPOOFING / SILENT REROUTE",
+                4: "PARAMETER SABOTAGE / DISARM"
+            }
+            threat_name = attack_names.get(attack_type, "LSTM ANOMALY")
+            self.status_banner.configure(text=f"⚠ SPECIFIC THREAT: {threat_name} DETECTED", text_color=NEON_RED)
             self.map_frame.configure(border_color=NEON_RED)
             self.btn_takeoff.configure(state="disabled", text="LOCKED OUT")
             self.term_text_left.configure(text_color=NEON_RED)
             self.term_text_right.configure(text_color=NEON_RED)
-            self.bridge.trigger_mitigation()
+            self.bridge.trigger_mitigation(attack_type)
+            
+            if not self._attack_logged:
+                self._attack_logged = True
+                t = time.strftime("%H:%M:%S")
+                self.history_box.configure(state="normal")
+                self.history_box.insert("2.0", f"[{t}] ⚠ {threat_name}\n")
+                self.history_box.configure(state="disabled")
         
         # 2. Update Graphs (Smart Pause Feature)
         is_idle = (alt < 0.2) and (spd < 0.2) and not is_attack
@@ -488,6 +661,7 @@ class CyberDefenseApp(ctk.CTk):
             self.pause_offset = 0.0
             self.last_time = time.time()
             self.was_idle = False
+            self.last_graph_draw = 0.0
             
         now = time.time()
         
@@ -502,20 +676,24 @@ class CyberDefenseApp(ctk.CTk):
             self.graph_alt.append(alt)
             self.graph_spd.append(spd)
             
-            self.line_alt.set_data(self.graph_time, self.graph_alt)
-            self.line_spd.set_data(self.graph_time, self.graph_spd)
-            
-            # Add safe limits to avoid empty sequence errors
-            min_alt = min(self.graph_alt) if self.graph_alt else 0
-            max_alt = max(self.graph_alt) if self.graph_alt else 10
-            min_spd = min(self.graph_spd) if self.graph_spd else 0
-            max_spd = max(self.graph_spd) if self.graph_spd else 5
-            
-            self.ax_alt.set_xlim(max(0, t - 30), t + 5)
-            self.ax_alt.set_ylim(min_alt - 2, max_alt + 5)
-            self.ax_spd.set_xlim(max(0, t - 30), t + 5)
-            self.ax_spd.set_ylim(min_spd - 2, max_spd + 5)
-            self.canvas.draw()
+            # Only redraw the graph at 1Hz (every 1 second) to save CPU
+            if now - self.last_graph_draw >= 1.0:
+                self.last_graph_draw = now
+                
+                self.line_alt.set_data(self.graph_time, self.graph_alt)
+                self.line_spd.set_data(self.graph_time, self.graph_spd)
+                
+                # Add safe limits to avoid empty sequence errors
+                min_alt = min(self.graph_alt) if self.graph_alt else 0
+                max_alt = max(self.graph_alt) if self.graph_alt else 10
+                min_spd = min(self.graph_spd) if self.graph_spd else 0
+                max_spd = max(self.graph_spd) if self.graph_spd else 5
+                
+                self.ax_alt.set_xlim(max(0, t - 30), t + 5)
+                self.ax_alt.set_ylim(min_alt - 2, max_alt + 5)
+                self.ax_spd.set_xlim(max(0, t - 30), t + 5)
+                self.ax_spd.set_ylim(min_spd - 2, max_spd + 5)
+                self.canvas.draw()
             
         self.last_time = now
         self.was_idle = is_idle
@@ -523,22 +701,40 @@ class CyberDefenseApp(ctk.CTk):
         # 3. Update Map
         if lat != 0 and lon != 0:
             if not self.drone_marker:
-                self.drone_marker = self.map_widget.set_marker(lat, lon, text="UAV", icon=self.drone_icon_img)
+                self.drone_marker = self.map_widget.set_marker(lat, lon, text=f"UAV\n{alt:.1f}m | {spd:.1f}m/s", icon=self.drone_icon_img)
                 self.map_widget.set_position(lat, lon)
                 self.map_widget.set_zoom(18)
                 self.home_location = (lat, lon)
             else:
                 self.drone_marker.set_position(lat, lon)
+                self.drone_marker.set_text(f"UAV\n{alt:.1f}m | {spd:.1f}m/s")
             
             new_pos = (lat, lon)
-            if len(self.path_points) == 0 or self.path_points[-1] != new_pos:
+            
+            # Anti-Freeze Logic: Only draw a new path segment if the drone moved at least ~2 meters
+            if len(self.path_points) == 0:
                 self.path_points.append(new_pos)
-                if self.path_polygon: self.path_polygon.delete()
-                self.path_polygon = self.map_widget.set_path(self.path_points, color=NEON_CYAN, width=2)
+            else:
+                last_pos = self.path_points[-1]
+                distance_moved = abs(new_pos[0] - last_pos[0]) + abs(new_pos[1] - last_pos[1])
+                
+                if distance_moved > 0.00002: # Approx 2 meters
+                    self.path_points.append(new_pos)
+                    
+                    # Prevent memory leak / massive lag by capping points
+                    if len(self.path_points) > 100:
+                        self.path_points.pop(0)
+                        
+                    if self.path_polygon: self.path_polygon.delete()
+                    if len(self.path_points) >= 2:
+                        self.path_polygon = self.map_widget.set_path(self.path_points, color=NEON_CYAN, width=2)
                 
             if is_attack and self.home_location:
                 if self.emergency_polygon: self.emergency_polygon.delete()
                 self.emergency_polygon = self.map_widget.set_path([new_pos, self.home_location], color=NEON_RED, width=3)
+            elif self.home_location:
+                if self.emergency_polygon: self.emergency_polygon.delete()
+                self.emergency_polygon = self.map_widget.set_path([new_pos, self.home_location], color="#475569", width=1)
                 
             # Draw Target Projection Line (Yellow)
             if self.target_marker:

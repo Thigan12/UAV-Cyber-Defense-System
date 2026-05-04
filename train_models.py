@@ -13,21 +13,21 @@ def preprocess_data(file_path):
     print("Loading data...")
     df = pd.read_csv(file_path)
     
-    # Forward fill and backward fill to handle sparse MAVLink data
-    print("Forward-filling sparse sensor data...")
-    df = df.ffill().bfill()
-    
-    # Drop non-numeric or irrelevant columns for training
-    df = df.drop(columns=['timestamp', 'msg_type', 'type', 'autopilot', 'base_mode', 'system_status', 'custom_mode'], errors='ignore')
+    # The new dataset from data_logger_fixed has clean columns:
+    # 19 features (lat..climb) + label — no nulls, no mode columns
+    # Drop any old-format or mode columns if they exist
+    df = df.drop(columns=['timestamp', 'msg_type', 'type', 'autopilot', 'system_status', 'custom_mode', 'base_mode'], errors='ignore')
     
     # Ensure everything is numeric
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    df = df.fillna(0) # Catch any remaining NaNs
+    df = df.fillna(0) # Safety net
     
-    y = df['label'].values
+    y = df['label'].astype(int).values
     X = df.drop(columns=['label']).values
+    
+    print(f"Features: {X.shape[1]}, Classes: {np.unique(y)}")
     
     # Normalize features
     scaler = StandardScaler()
@@ -47,21 +47,22 @@ def create_sequences(X, y, time_steps=10):
         ys.append(y[i + time_steps])
     return np.array(Xs), np.array(ys)
 
-def build_lstm(input_shape):
+def build_lstm(input_shape, num_classes=5):
     model = Sequential([
         LSTM(64, input_shape=input_shape, return_sequences=True),
         Dropout(0.2),
         LSTM(32),
         Dropout(0.2),
         Dense(16, activation='relu'),
-        Dense(1, activation='sigmoid')
+        Dense(num_classes, activation='softmax')
     ])
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
 def train_and_evaluate():
-    X_scaled, y = preprocess_data('combined_dataset.csv')
-    print(f"Data preprocessed. X shape: {X_scaled.shape}, y shape: {y.shape}")
+    X_scaled, y = preprocess_data('perfect_dataset.csv')
+    num_classes = len(np.unique(y))
+    print(f"Data preprocessed. X shape: {X_scaled.shape}, y shape: {y.shape}, Classes: {num_classes}")
     
     # ---------------------------------------------------------
     # Baseline 1: Random Forest (Non-temporal)
@@ -90,10 +91,10 @@ def train_and_evaluate():
     # For demonstration, we'll train fully on the first fold, and just score the rest to save time
     for train, test in kfold.split(X_seq, y_seq):
         print(f"Training Fold {fold_no}...")
-        model = build_lstm((X_seq.shape[1], X_seq.shape[2]))
+        model = build_lstm((X_seq.shape[1], X_seq.shape[2]), num_classes)
         
-        # Train for 5 epochs (keep it fast for demonstration)
-        model.fit(X_seq[train], y_seq[train], epochs=5, batch_size=64, verbose=0)
+        # Train for 20 epochs for proper convergence
+        model.fit(X_seq[train], y_seq[train], epochs=20, batch_size=64, verbose=0)
         
         scores = model.evaluate(X_seq[test], y_seq[test], verbose=0)
         print(f"Score for fold {fold_no}: {model.metrics_names[1]} of {scores[1]*100:.2f}%")

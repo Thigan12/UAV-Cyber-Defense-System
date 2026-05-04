@@ -147,15 +147,22 @@ Watch the drone map—you should see it spin out of control or behave erraticall
 Let me know when you have both CSV files!
 
 Phase 2: Detection Pipeline
-[ ] Data preprocessing (cleaning, windowing for time-series)
-.
+[x] Data preprocessing (cleaning, windowing for time-series)
+[x] Train LSTM model
+[x] Train baseline models (Random Forest, Isolation Forest)
+[x] Implement 5-fold cross-validation and evaluation script
+[x] Save trained models
 
-[ ] Train LSTM model
-[ ] Train baseline models (Random Forest, Isolation Forest)
-[ ] Implement 5-fold cross-validation and evaluation script
-[ ] Save trained models
 Phase 3: Live Monitoring & Integration
-[ ] Set up MQTT broker
-[ ] Write live telemetry bridge (SITL -> ML model -> MQTT)
-[ ] Develop real-time dashboard (React or Streamlit)
-[ ] Full end-to-end testing
+[x] Set up Desktop Application (CustomTkinter)
+[x] Write live telemetry bridge (SITL -> ML model -> UI Thread)
+[x] Develop real-time dashboard (Map, Graphs, Attack Gauge)
+[x] Implement Granular Logging & Smart Graph Pausing
+[x] Full end-to-end testing
+[x] Project deployed to GitHub
+
+Phase 5: Advanced Cyberattack Scripts
+[ ] Implement Attack 1: RC Channel Hijack (Crash override)
+[ ] Implement Attack 2: Malicious Mode Forcing (Forced RTL/LAND)
+[ ] Implement Attack 3: GPS Waypoint Spoofing (Rerouting)
+[ ] Implement Attack 4: Mid-Air Disarm & Parameter Manipulation
