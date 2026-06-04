@@ -96,9 +96,8 @@ This document contains every single task from the absolute beginning of the proj
   - Autonomously force the drone into `RTL` (Return to Launch) mode.
   - Ignore the command center controls until the drone lands safely.
 
-## 🔲 PHASE 5: GUI Dashboard Upgrade (FINAL STEP)
-- [ ] Update `desktop_app.py` UI safely.
-- [ ] **The Alert System:** Flash a critical red warning ("THREAT DETECTED. COMMUNICATION SEVERED. INITIATING AUTONOMOUS RETURN.")
-- [ ] **Auto-Return Tracking:** Program the map to draw a dynamic red line from the exact GPS point of the attack straight back to the Home Base.
-- [ ] Display the specific attack type (e.g. "GPS SPOOFING") and confidence percentage on the dashboard.
+## 🔲 PHASE 5: GUI Dashboard Rebuild (PyQt5 Migration)
+- [ ] Rebuild dashboard using PyQt5 architecture for all 6 sidebar pages.
+- [ ] See [PHASE5_UI_REBUILD_TASKS.md](file:///home/thigan/Desktop/FYP%20PROJECT/PHASE5_UI_REBUILD_TASKS.md) for the detailed step-by-step implementation plan including all functions, modules, and components.
 - [ ] Perform the Final End-to-End Live Demonstration!
+
