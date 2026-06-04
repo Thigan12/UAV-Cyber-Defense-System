@@ -11,6 +11,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from feature_extractor import FeatureExtractor
 
 # --- CYBERPUNK / MILITARY THEME ---
 BG_DARK = "#0a0f18"
@@ -31,13 +32,12 @@ class UAVDataBridge:
         self.is_compromised = False
         
         # LSTM Model
-        self.model = tf.keras.models.load_model('lstm_uav_model.h5')
-        with open('scaler.pkl', 'rb') as f:
+        self.model = tf.keras.models.load_model('lstm_uav_v2.h5')
+        with open('scaler_v2.pkl', 'rb') as f:
             self.scaler = pickle.load(f)
             
-        self.TIME_STEPS = 10
+        self.TIME_STEPS = 50
         self.rolling_window = collections.deque(maxlen=self.TIME_STEPS)
-        self.current_state = np.zeros(19)
         self.current_flight_mode = 0
         self.is_connected = False
         self.is_user_navigating = False
@@ -64,8 +64,10 @@ class UAVDataBridge:
             mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
         )
         
-        TARGET_MESSAGES = ['GPS_RAW_INT', 'ATTITUDE', 'VFR_HUD', 'HEARTBEAT']
+        TARGET_MESSAGES = ['GPS_RAW_INT', 'ATTITUDE', 'VFR_HUD', 'HEARTBEAT', 'RC_CHANNELS_RAW', 'SERVO_OUTPUT_RAW', 'GLOBAL_POSITION_INT']
         self.vfr_alt = 0.0
+        self.extractor = FeatureExtractor()
+        state_dict = {}
         
         while True:
             msg = self.vehicle.recv_match(type=TARGET_MESSAGES, blocking=True, timeout=1.0)
@@ -77,16 +79,28 @@ class UAVDataBridge:
             self.ui_callback(msg_log=f"{msg_type} {msg}", log_type="packet")
             
             if msg_type == 'GPS_RAW_INT':
-                self.current_state[0:8] = [msg.lat, msg.lon, msg.alt, msg.eph, msg.epv, msg.vel, msg.cog, msg.satellites_visible]
+                state_dict.update({'lat': msg.lat, 'lon': msg.lon, 'alt': msg.alt, 'groundspeed': msg.vel})
+                self.current_gps_lat = msg.lat # Cache for takeoff check
+                self.current_gps_alt = msg.alt # Cache for land/takeoff check
             elif msg_type == 'ATTITUDE':
-                self.current_state[8:14] = [msg.roll, msg.pitch, msg.yaw, msg.rollspeed, msg.pitchspeed, msg.yawspeed]
+                state_dict.update({'pitch': msg.pitch, 'roll': msg.roll, 'yaw': msg.yaw,
+                                   'pitchspeed': msg.pitchspeed, 'rollspeed': msg.rollspeed, 'yawspeed': msg.yawspeed})
             elif msg_type == 'VFR_HUD':
-                self.current_state[14:19] = [msg.airspeed, msg.groundspeed, msg.heading, msg.throttle, msg.climb]
+                state_dict.update({'airspeed': msg.airspeed, 'groundspeed': msg.groundspeed, 'alt': msg.alt,
+                                   'heading': msg.heading, 'throttle': msg.throttle, 'climb': msg.climb})
                 self.vfr_alt = msg.alt # VFR_HUD provides highly smooth EKF altitude in meters!
                 if self.home_alt is None:
                     self.home_alt = self.vfr_alt
+            elif msg_type == 'RC_CHANNELS_RAW':
+                state_dict.update({'chan1_raw': msg.chan1_raw, 'chan3_raw': msg.chan3_raw})
+            elif msg_type == 'SERVO_OUTPUT_RAW':
+                state_dict.update({'servo1_raw': msg.servo1_raw, 'servo3_raw': msg.servo3_raw})
+            elif msg_type == 'GLOBAL_POSITION_INT':
+                state_dict['vz'] = msg.vz / 100.0
             elif msg_type == 'HEARTBEAT':
                 self.current_flight_mode = msg.custom_mode
+                armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                state_dict['armed'] = float(armed)
                 
             current_time = time.time()
             if not hasattr(self, 'last_sample_time'):
@@ -94,17 +108,24 @@ class UAVDataBridge:
                 
             if current_time - self.last_sample_time >= 0.1:
                 self.last_sample_time = current_time
-                self.rolling_window.append(self.current_state.copy())
                 
-                is_attack = False
-                confidence = 0.0
-                current_attack_type = 0
-                if len(self.rolling_window) == self.TIME_STEPS:
-                    window_scaled = self.scaler.transform(np.array(self.rolling_window))
-                    window_reshaped = np.reshape(window_scaled, (1, self.TIME_STEPS, 19))
-                    pred_array = self.model.predict(window_reshaped, verbose=0)[0]
-                    pred_class = int(np.argmax(pred_array))
-                    pred_prob = float(pred_array[pred_class])
+                # Check if we have minimum requirements to run extractor
+                if 'lat' in state_dict and 'roll' in state_dict and 'airspeed' in state_dict:
+                    current_features = self.extractor.extract(state_dict)
+                    self.rolling_window.append(current_features)
+                    
+                    is_attack = False
+                    confidence = 0.0
+                    current_attack_type = 0
+                    pred_class = 0
+                    pred_prob = 0.0
+                    pred_array = np.zeros(5)
+                    if len(self.rolling_window) == self.TIME_STEPS:
+                        window_scaled = self.scaler.transform(np.array(self.rolling_window))
+                        window_reshaped = np.reshape(window_scaled, (1, self.TIME_STEPS, 26))
+                        pred_array = self.model.predict(window_reshaped, verbose=0)[0]
+                        pred_class = int(np.argmax(pred_array))
+                        pred_prob = float(pred_array[pred_class])
                     
                     # --- AI NOISE GATE & SMOOTHING ---
                     original_class = pred_class  # Save for debug log
@@ -158,14 +179,14 @@ class UAVDataBridge:
                         f"{confidence:.4f},"
                         f"{'ATTACK' if is_attack else 'ok'},"
                         f"{current_alt_dbg:.1f},"
-                        f"{self.current_state[14]:.2f},"
+                        f"{state_dict.get('groundspeed', 0):.2f},"
                         f"{probs_str}\n"
                     )
                     self._debug_log.flush()
                     
                 # Emit telemetry to UI (Updated at 10Hz along with AI)
-                lat = float(self.current_state[0]) / 1e7 if self.current_state[0] != 0 else 0
-                lon = float(self.current_state[1]) / 1e7 if self.current_state[1] != 0 else 0
+                lat = float(state_dict.get('lat', 0)) / 1e7 if state_dict.get('lat', 0) != 0 else 0
+                lon = float(state_dict.get('lon', 0)) / 1e7 if state_dict.get('lon', 0) != 0 else 0
                 
                 # Use VFR_HUD smoothed altitude for the Graph, not raw GPS
                 if self.home_alt is not None:
@@ -173,7 +194,7 @@ class UAVDataBridge:
                 else:
                     alt = 0.0
                     
-                spd = float(self.current_state[14])
+                spd = float(state_dict.get('groundspeed', 0))
                 
                 self.ui_callback(telemetry=(lat, lon, alt, spd, is_attack, confidence, current_attack_type))
 
@@ -238,7 +259,7 @@ class UAVDataBridge:
                 # 0. Wait for GPS
                 self.ui_callback(msg_log=f"[SYSTEM] Waiting for GPS 3D Fix...", log_type="system")
                 for _ in range(60):
-                    if float(self.current_state[0]) != 0: # Check if we have valid latitude
+                    if hasattr(self, 'current_gps_lat') and self.current_gps_lat != 0: # Check if we have valid latitude
                         break
                     time.sleep(1.0)
                 
@@ -304,9 +325,8 @@ class UAVDataBridge:
                 time.sleep(0.5)
                 self.ui_callback(msg_log=f"[SYSTEM] Decreasing altitude...", log_type="system")
                 
-                # Wait until grounded
                 for _ in range(30):
-                    alt_check = float(self.current_state[2]) / 1000.0
+                    alt_check = float(getattr(self, 'current_gps_alt', 0)) / 1000.0
                     if self.home_alt is not None: alt_check = max(0.0, alt_check - self.home_alt)
                     if alt_check < 0.5: break
                     time.sleep(1.0)
@@ -344,7 +364,7 @@ class UAVDataBridge:
             time.sleep(0.5)
             self.ui_callback(msg_log=f"[SYSTEM] Calculating optimal vector path...", log_type="system")
             
-            current_alt = float(self.current_state[2]) / 1000.0
+            current_alt = float(getattr(self, 'current_gps_alt', 0)) / 1000.0
             if self.home_alt is not None:
                 current_alt = max(0.0, current_alt - self.home_alt)
                 
@@ -353,7 +373,7 @@ class UAVDataBridge:
                 self.ui_callback(msg_log=f"[SYSTEM] Drone grounded. Auto-Takeoff sequence required.", log_type="system")
                 self.ui_callback(msg_log=f"[SYSTEM] Waiting for GPS 3D Fix...", log_type="system")
                 for _ in range(60):
-                    if float(self.current_state[0]) != 0:
+                    if hasattr(self, 'current_gps_lat') and self.current_gps_lat != 0:
                         break
                     time.sleep(1.0)
                     
@@ -473,6 +493,8 @@ class CyberDefenseApp(ctk.CTk):
             pos = self.drone_marker.position
             self.map_widget.set_position(pos[0], pos[1])
             self.map_widget.set_zoom(18)
+        else:
+            self.update_terminal("[SYSTEM] Cannot locate UAV. Waiting for GPS 3D Fix from simulator...", "system")
 
     def set_target_waypoint(self, coords):
         lat, lon = coords

@@ -15,3 +15,17 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# ML model artifacts (large binary files)
+*.h5
+*.pkl
+*.hdf5
+
+# Large datasets
+*.csv
+
+# Logs
+*.log
+
+# Generated PDFs
+*.pdf
