@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8"/>
+    <title>UAV IDS Live Map</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        html, body, #map { height: 100%; margin: 0; padding: 0; background: #0a0f18; }
+        .leaflet-container { background: #0a0f18; }
+
+        /* Disable native right-click context menu */
+        * { -webkit-user-select: none; user-select: none; }
+
+        /* Fly-to popup overlay */
+        #fly-popup {
+            display: none;
+            position: absolute;
+            z-index: 9999;
+            background: #1a2332;
+            border: 2px solid #00d4ff;
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: #e2e8f0;
+            font-family: 'Arial', sans-serif;
+            font-size: 13px;
+            box-shadow: 0 0 20px rgba(0,212,255,0.3);
+            min-width: 220px;
+        }
+        #fly-popup .popup-title {
+            color: #00d4ff;
+            font-weight: bold;
+            font-size: 12px;
+            margin-bottom: 6px;
+            letter-spacing: 1px;
+        }
+        #fly-popup .popup-coords {
+            color: #fbbf24;
+            font-size: 11px;
+            margin-bottom: 10px;
+        }
+        #fly-popup .popup-btn {
+            display: inline-block;
+            padding: 6px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: bold;
+            border: none;
+            margin-right: 6px;
+        }
+        #fly-popup .btn-fly {
+            background: #00d4ff;
+            color: #0a0f18;
+        }
+        #fly-popup .btn-fly:hover { background: #00b8d9; }
+        #fly-popup .btn-cancel {
+            background: #1e293b;
+            color: #64748b;
+            border: 1px solid #1e293b;
+        }
+        #fly-popup .btn-cancel:hover { background: #334155; }
+    </style>
+</head>
+<body oncontextmenu="return false;">
+    <div id="map"></div>
+
+    <!-- Fly-to Confirmation Popup -->
+    <div id="fly-popup">
+        <div class="popup-title">▶ FLY TO WAYPOINT</div>
+        <div class="popup-coords" id="popup-coords-text">0.000000, 0.000000</div>
+        <button class="popup-btn btn-fly" onclick="confirmFly()">✈ Fly Here</button>
+        <button class="popup-btn btn-cancel" onclick="cancelFly()">✕ Cancel</button>
+    </div>
+
+    <script>
+        var map = L.map('map', {zoomControl: false, contextmenu: false}).setView([0, 0], 2);
+
+        // Esri Satellite
+        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri'
+        }).addTo(map);
+
+        var droneIcon = L.icon({
+            iconUrl: 'drone_icon.png',
+            iconSize: [40, 40],
+            iconAnchor: [20, 20],
+            popupAnchor: [0, -20]
+        });
+
+        var homeIcon = L.divIcon({
+            html: '<div style="background-color: #00ff88; color: black; font-weight: bold; border-radius: 50%; width: 24px; height: 24px; text-align: center; line-height: 24px; font-family: Arial; border: 2px solid white;">H</div>',
+            className: '',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        });
+
+        var targetIcon = L.divIcon({
+            html: '<div style="background-color: #f59e0b; color: black; font-weight: bold; border-radius: 50%; width: 28px; height: 28px; text-align: center; line-height: 28px; font-family: Arial; border: 2px solid white; font-size: 14px;">T</div>',
+            className: '',
+            iconSize: [28, 28],
+            iconAnchor: [14, 14]
+        });
+
+        var droneMarker = null;
+        var homeMarker = null;
+        var targetMarker = null;
+        var flightPath = L.polyline([], {color: '#00ff88', weight: 3}).addTo(map);
+        var rtlPath = null;
+        var attackZone = null;
+        var isFirstPosition = true;
+
+        // Pending waypoint coordinates
+        var pendingLat = 0;
+        var pendingLon = 0;
+
+        function updateDronePosition(lat, lon, alt, speed) {
+            var latlng = [lat, lon];
+            if (!droneMarker) {
+                droneMarker = L.marker(latlng, {icon: droneIcon}).addTo(map);
+                droneMarker.bindPopup("<b>UAV</b><br>Alt: " + alt.toFixed(1) + "m<br>Spd: " + speed.toFixed(1) + "m/s");
+                if (isFirstPosition) {
+                    map.setView(latlng, 18);
+                    isFirstPosition = false;
+                }
+            } else {
+                droneMarker.setLatLng(latlng);
+                droneMarker.setPopupContent("<b>UAV</b><br>Alt: " + alt.toFixed(1) + "m<br>Spd: " + speed.toFixed(1) + "m/s");
+            }
+        }
+
+        function addPathPoint(lat, lon) {
+            flightPath.addLatLng([lat, lon]);
+        }
+
+        function setHomePosition(lat, lon) {
+            if (!homeMarker) {
+                homeMarker = L.marker([lat, lon], {icon: homeIcon}).addTo(map);
+                homeMarker.bindPopup("<b>Home Point</b>");
+            } else {
+                homeMarker.setLatLng([lat, lon]);
+            }
+        }
+
+        function showAttackZone(lat, lon) {
+            if (!attackZone) {
+                attackZone = L.circle([lat, lon], {
+                    color: 'red',
+                    fillColor: '#f03',
+                    fillOpacity: 0.5,
+                    radius: 50
+                }).addTo(map);
+                attackZone.bindPopup("<b>Threat Detected Zone</b>");
+            } else {
+                attackZone.setLatLng([lat, lon]);
+            }
+        }
+
+        function clearAttackZone() {
+            if (attackZone) {
+                map.removeLayer(attackZone);
+                attackZone = null;
+            }
+        }
+
+        function showRTLPath(from_lat, from_lon, to_lat, to_lon) {
+            if (rtlPath) {
+                map.removeLayer(rtlPath);
+            }
+            rtlPath = L.polyline([[from_lat, from_lon], [to_lat, to_lon]], {
+                color: 'red',
+                weight: 3,
+                dashArray: '10, 10'
+            }).addTo(map);
+        }
+
+        function clearRTLPath() {
+            if (rtlPath) {
+                map.removeLayer(rtlPath);
+                rtlPath = null;
+            }
+        }
+
+        function mapZoomIn() { map.zoomIn(); }
+        function mapZoomOut() { map.zoomOut(); }
+        function centerUAV(lat, lon) { map.setView([lat, lon], 18); }
+
+        // Show the fly-to popup at a screen position
+        function showFlyPopup(containerPoint, lat, lon) {
+            pendingLat = lat;
+            pendingLon = lon;
+
+            var popup = document.getElementById('fly-popup');
+            document.getElementById('popup-coords-text').textContent =
+                lat.toFixed(6) + '°, ' + lon.toFixed(6) + '°';
+
+            // Position popup near click, keeping within viewport
+            var px = containerPoint.x + 10;
+            var py = containerPoint.y + 10;
+            var pw = 240, ph = 100;
+            if (px + pw > window.innerWidth)  px = containerPoint.x - pw - 10;
+            if (py + ph > window.innerHeight) py = containerPoint.y - ph - 10;
+
+            popup.style.left = px + 'px';
+            popup.style.top  = py + 'px';
+            popup.style.display = 'block';
+
+            // Place/move target marker
+            if (!targetMarker) {
+                targetMarker = L.marker([lat, lon], {icon: targetIcon}).addTo(map);
+                targetMarker.bindPopup('<b>Pending Waypoint</b>');
+            } else {
+                targetMarker.setLatLng([lat, lon]);
+            }
+        }
+
+        function confirmFly() {
+            document.getElementById('fly-popup').style.display = 'none';
+            // Signal Python via console.log
+            console.log('FLY_TO:' + pendingLat + ',' + pendingLon);
+        }
+
+        function cancelFly() {
+            document.getElementById('fly-popup').style.display = 'none';
+            if (targetMarker) {
+                map.removeLayer(targetMarker);
+                targetMarker = null;
+            }
+        }
+
+        // Hide popup when clicking elsewhere on the map
+        map.on('click', function(e) {
+            document.getElementById('fly-popup').style.display = 'none';
+        });
+
+        // RIGHT-CLICK: Open fly-to confirmation popup
+        map.on('contextmenu', function(e) {
+            L.DomEvent.preventDefault(e);
+            showFlyPopup(e.containerPoint, e.latlng.lat, e.latlng.lng);
+        });
+
+        // Also support double-click for accessibility
+        map.on('dblclick', function(e) {
+            L.DomEvent.preventDefault(e);
+            showFlyPopup(e.containerPoint, e.latlng.lat, e.latlng.lng);
+        });
+    </script>
+</body>
+</html>

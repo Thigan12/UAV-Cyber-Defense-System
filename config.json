@@ -1,0 +1,12 @@
+{
+    "mavlink_url": "udp:127.0.0.1:14550",
+    "model_path": "lstm_uav_v2.h5",
+    "scaler_path": "scaler_v2.pkl",
+    "confidence_threshold": 0.95,
+    "warmup_seconds": 10,
+    "consensus_ticks": 3,
+    "telemetry_rate": 0,
+    "auto_mitigate": true,
+    "gps_failsafe": true,
+    "operator_lock": true
+}

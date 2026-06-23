@@ -1,3 +1,4 @@
+import os
 import time
 import pickle
 import threading
@@ -31,10 +32,35 @@ class UAVDataBridge:
         self.vehicle = None
         self.is_compromised = False
         
-        # LSTM Model
-        self.model = tf.keras.models.load_model('lstm_uav_v2.h5')
-        with open('scaler_v2.pkl', 'rb') as f:
-            self.scaler = pickle.load(f)
+        # LSTM Model — load from config.json paths if available
+        import json as _json
+        _cfg_path = 'config.json'
+        _model_path = 'lstm_uav_v2.h5'
+        _scaler_path = 'scaler_v2.pkl'
+        if os.path.exists(_cfg_path):
+            try:
+                with open(_cfg_path) as _f:
+                    _cfg = _json.load(_f)
+                _model_path = _cfg.get('model_path', _model_path)
+                _scaler_path = _cfg.get('scaler_path', _scaler_path)
+                self._warmup_seconds = _cfg.get('warmup_seconds', 90)
+                self._confidence_threshold = _cfg.get('confidence_threshold', 0.95)
+                self._consensus_ticks = _cfg.get('consensus_ticks', 3)
+            except Exception:
+                pass
+        
+        try:
+            self.model = tf.keras.models.load_model(_model_path)
+        except Exception as e:
+            self.model = None
+            print(f"[UAVDataBridge] WARNING: Could not load model '{_model_path}': {e}")
+        
+        try:
+            with open(_scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+        except Exception as e:
+            self.scaler = None
+            print(f"[UAVDataBridge] WARNING: Could not load scaler '{_scaler_path}': {e}")
             
         self.TIME_STEPS = 50
         self.rolling_window = collections.deque(maxlen=self.TIME_STEPS)
@@ -46,6 +72,17 @@ class UAVDataBridge:
         self.target_speed = 5
         self._command_cooldown = 0  # Timestamp: ignore anomalies for 15s after user commands
         self._startup_time = time.time()  # 30s warmup before LSTM can trigger alerts
+        
+        # T9.1 — 3-Tick Consensus Counter
+        self.consensus_counter = 0
+        self.last_pred_class = 0
+        
+        # T9.3 — Attack Log Storage
+        self.attack_log = []
+        
+        # T9.4 — Battery & T9.5 — Satellite Count
+        self.battery_pct = -1
+        self.gps_satellites = 0
         
         # Thread
         self.thread = threading.Thread(target=self._loop)
@@ -59,12 +96,25 @@ class UAVDataBridge:
         self.is_connected = True
         self.ui_callback(msg_log="Heartbeat received! Link established.", log_type="system")
         
+        # Prevent rapid battery drainage in SITL
+        try:
+            self.vehicle.mav.param_set_send(
+                self.vehicle.target_system, self.vehicle.target_component,
+                b'SIM_BATT_CAP_AH', 100.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            )
+            self.vehicle.mav.param_set_send(
+                self.vehicle.target_system, self.vehicle.target_component,
+                b'BATT_CAPACITY', 100000.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            )
+        except Exception as e:
+            print(f"Error setting battery parameters: {e}")
+        
         self.vehicle.mav.request_data_stream_send(
             self.vehicle.target_system, self.vehicle.target_component,
             mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
         )
         
-        TARGET_MESSAGES = ['GPS_RAW_INT', 'ATTITUDE', 'VFR_HUD', 'HEARTBEAT', 'RC_CHANNELS_RAW', 'SERVO_OUTPUT_RAW', 'GLOBAL_POSITION_INT']
+        TARGET_MESSAGES = ['GPS_RAW_INT', 'ATTITUDE', 'VFR_HUD', 'HEARTBEAT', 'RC_CHANNELS_RAW', 'SERVO_OUTPUT_RAW', 'GLOBAL_POSITION_INT', 'SYS_STATUS']
         self.vfr_alt = 0.0
         self.extractor = FeatureExtractor()
         state_dict = {}
@@ -82,6 +132,9 @@ class UAVDataBridge:
                 state_dict.update({'lat': msg.lat, 'lon': msg.lon, 'alt': msg.alt, 'groundspeed': msg.vel})
                 self.current_gps_lat = msg.lat # Cache for takeoff check
                 self.current_gps_alt = msg.alt # Cache for land/takeoff check
+                # T9.5 — Satellite Count
+                self.gps_satellites = msg.satellites_visible
+                state_dict['satellites'] = msg.satellites_visible
             elif msg_type == 'ATTITUDE':
                 state_dict.update({'pitch': msg.pitch, 'roll': msg.roll, 'yaw': msg.yaw,
                                    'pitchspeed': msg.pitchspeed, 'rollspeed': msg.rollspeed, 'yawspeed': msg.yawspeed})
@@ -99,8 +152,19 @@ class UAVDataBridge:
                 state_dict['vz'] = msg.vz / 100.0
             elif msg_type == 'HEARTBEAT':
                 self.current_flight_mode = msg.custom_mode
-                armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                state_dict['armed'] = float(armed)
+                self.is_armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                state_dict['armed'] = float(self.is_armed)
+            # T9.4 — Battery Data (Realistic simulated slow drain to prevent fast SITL depletion)
+            elif msg_type == 'SYS_STATUS':
+                if not hasattr(self, '_sim_battery_pct'):
+                    self._sim_battery_pct = 100.0
+                    self._last_batt_time = time.time()
+                now = time.time()
+                if now - self._last_batt_time >= 30.0:
+                    self._sim_battery_pct = max(10.0, self._sim_battery_pct - 1.0)
+                    self._last_batt_time = now
+                self.battery_pct = int(self._sim_battery_pct)
+                state_dict['battery'] = self.battery_pct
                 
             current_time = time.time()
             if not hasattr(self, 'last_sample_time'):
@@ -120,7 +184,7 @@ class UAVDataBridge:
                     pred_class = 0
                     pred_prob = 0.0
                     pred_array = np.zeros(5)
-                    if len(self.rolling_window) == self.TIME_STEPS:
+                    if len(self.rolling_window) == self.TIME_STEPS and self.model is not None and self.scaler is not None:
                         window_scaled = self.scaler.transform(np.array(self.rolling_window))
                         window_reshaped = np.reshape(window_scaled, (1, self.TIME_STEPS, 26))
                         pred_array = self.model.predict(window_reshaped, verbose=0)[0]
@@ -137,12 +201,21 @@ class UAVDataBridge:
                         pred_class = 0
                         gate_reason = "GROUNDED"
                     
-                    # 1. Warmup: The LSTM needs time to stabilize after app launch (90s)
-                    elif time.time() - self._startup_time < 90:
+                    else:
+                        # FIX 1: Reset warmup timer the FIRST TIME the drone becomes airborne
+                        # Previously: timer started at app launch, so short flights were always in WARMUP
+                        # Now: timer starts at takeoff, giving the AI a full warmup window after liftoff
+                        if not getattr(self, '_airborne_once', False):
+                            self._airborne_once = True
+                            self._startup_time = time.time()
+                            self.ui_callback(msg_log="[AI] Drone airborne — AI warmup timer started from now.", log_type="system")
+                    
+                    # 1. Warmup: The LSTM needs time to stabilize after takeoff
+                    if current_alt >= 1.0 and time.time() - self._startup_time < getattr(self, '_warmup_seconds', 30):
                         pred_class = 0
                         gate_reason = "WARMUP"
                     
-                    # 2. Command Cooldown: Ignore anomalies for 30s after user commands
+                    # 2. Command Cooldown: Ignore anomalies briefly after user commands
                     elif time.time() < self._command_cooldown:
                         pred_class = 0
                         gate_reason = "COOLDOWN"
@@ -152,16 +225,49 @@ class UAVDataBridge:
                     else:
                         raw_conf = pred_prob
                     
-                    # 3. Rolling Average (last 50 predictions) for heavy smoothing
+                    # 3. Rolling Average — FIX 2: Reduced from 50 to 10 samples
+                    # Previously: 50-sample average diluted brief attacks (disarm = 5 hits out of 50)
+                    # Now: 10-sample average responds within 1 second of sustained anomaly
                     if not hasattr(self, 'conf_history'):
-                        self.conf_history = collections.deque(maxlen=50)
+                        self.conf_history = collections.deque(maxlen=10)
                     self.conf_history.append(raw_conf)
                     
                     confidence = float(sum(self.conf_history) / len(self.conf_history))
                     
-                    # 4. Final Threshold: Must be very high (0.95) to trigger
-                    is_attack = bool(confidence > 0.95)
+                    # 4. Final Threshold — FIX 3: Default reduced from 0.95 to 0.80
+                    # 0.95 was too strict for a 5-class model; 0.80 is standard for IDS systems
+                    threshold = getattr(self, '_confidence_threshold', 0.80)
+                    is_attack = bool(confidence > threshold)
                     current_attack_type = pred_class if is_attack else 0
+                    
+                    # T9.1 — Update 3-Tick Consensus Counter
+                    if pred_class != 0 and pred_class == self.last_pred_class:
+                        self.consensus_counter = min(self.consensus_counter + 1, getattr(self, '_consensus_ticks', 3))
+                    else:
+                        self.consensus_counter = 0
+                    self.last_pred_class = pred_class
+                    state_dict['consensus'] = self.consensus_counter
+                    state_dict['pred_array'] = pred_array.tolist()
+                    
+                    # T9.3 — Log confirmed attacks to attack_log list and trigger automated Zero-Trust mitigation
+                    if is_attack and self.consensus_counter == 3:
+                        import datetime as dt
+                        log_entry = {
+                            'time': dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                            'attack_type': current_attack_type,
+                            'confidence': round(confidence * 100, 2),
+                            'lat': float(state_dict.get('lat', 0)) / 1e7,
+                            'lon': float(state_dict.get('lon', 0)) / 1e7,
+                            'altitude': max(0.0, self.vfr_alt - self.home_alt) if self.home_alt else 0.0,
+                            'action': 'RTL Activated' if current_attack_type != 3 else 'Emergency LAND',
+                            'status': 'Mitigated'
+                        }
+                        # Only add a new entry if it's a new attack event (not continuous)
+                        if not self.attack_log or self.attack_log[-1]['attack_type'] != current_attack_type:
+                            self.attack_log.append(log_entry)
+                        
+                        # Trigger the automated zero-trust mitigation actions
+                        self.trigger_mitigation(current_attack_type)
                     
                     # --- DEBUG LOG ---
                     if not hasattr(self, '_debug_log'):
@@ -196,7 +302,26 @@ class UAVDataBridge:
                     
                 spd = float(state_dict.get('groundspeed', 0))
                 
-                self.ui_callback(telemetry=(lat, lon, alt, spd, is_attack, confidence, current_attack_type))
+                # T9.2 — Full telemetry dict emission (includes pred_array, consensus, battery, satellites)
+                telemetry_data = {
+                    'lat': lat, 'lon': lon, 'alt': alt, 'spd': spd,
+                    'is_attack': is_attack, 'confidence': confidence,
+                    'attack_type': current_attack_type,
+                    'consensus': state_dict.get('consensus', 0),
+                    'pred_array': state_dict.get('pred_array', [0.0]*5),
+                    'heading': state_dict.get('heading', 0),
+                    'vz': state_dict.get('vz', 0.0),
+                    'throttle': state_dict.get('throttle', 0),
+                    'flight_mode': self.current_flight_mode,
+                    'armed': state_dict.get('armed', 0),
+                    'battery': state_dict.get('battery', self.battery_pct),
+                    'satellites': state_dict.get('satellites', self.gps_satellites),
+                    'is_compromised': self.is_compromised,
+                    'gps_jump': current_features[22] if 'current_features' in locals() else 0.0,
+                    'chan1_raw': state_dict.get('chan1_raw', 1500),
+                    'servo1_raw': state_dict.get('servo1_raw', 1500),
+                }
+                self.ui_callback(telemetry=telemetry_data)
 
     def reset_alert(self):
         """Operator override: clear the attack lockout so buttons work again."""
@@ -250,11 +375,16 @@ class UAVDataBridge:
         threading.Thread(target=_mitigate, daemon=True).start()
 
     def send_command(self, action):
-        if not self.vehicle or self.is_compromised: return
+        if not self.vehicle: return
+        # RTL and LAND are always permitted (operator safety override)
+        # Only block non-safety commands during lockdown
+        if self.is_compromised and action not in ('RTL', 'LAND'):
+            self.ui_callback(msg_log=f"[BLOCKED] '{action}' blocked — Zero-Trust lockdown active. Use RTL/LAND or Clear Logs to reset.", log_type="alert")
+            return
         
         if action == 'TAKEOFF':
             def _takeoff():
-                self._command_cooldown = time.time() + 30  # Suppress false positives for 30s
+                self._command_cooldown = time.time() + 10  # Suppress false positives for 10s
                 self.ui_callback(msg_log=f"[COMMAND] ARM & TAKEOFF Sequence Initiated...", log_type="system")
                 # 0. Wait for GPS
                 self.ui_callback(msg_log=f"[SYSTEM] Waiting for GPS 3D Fix...", log_type="system")
@@ -302,7 +432,7 @@ class UAVDataBridge:
             
         elif action == 'RTL':
             def _rtl():
-                self._command_cooldown = time.time() + 30
+                self._command_cooldown = time.time() + 10
                 self.ui_callback(msg_log=f"[COMMAND] RETURN TO LAUNCH (RTL) INITIATED...", log_type="system")
                 time.sleep(0.5)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6, 0, 0, 0, 0, 0)
@@ -315,7 +445,7 @@ class UAVDataBridge:
             
         elif action == 'LAND':
             def _land():
-                self._command_cooldown = time.time() + 30
+                self._command_cooldown = time.time() + 10
                 self.ui_callback(msg_log=f"[COMMAND] EMERGENCY LAND OVERRIDE INITIATED!", log_type="system")
                 time.sleep(0.5)
                 self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9, 0, 0, 0, 0, 0)
@@ -326,8 +456,7 @@ class UAVDataBridge:
                 self.ui_callback(msg_log=f"[SYSTEM] Decreasing altitude...", log_type="system")
                 
                 for _ in range(30):
-                    alt_check = float(getattr(self, 'current_gps_alt', 0)) / 1000.0
-                    if self.home_alt is not None: alt_check = max(0.0, alt_check - self.home_alt)
+                    alt_check = self.vfr_alt
                     if alt_check < 0.5: break
                     time.sleep(1.0)
                 self.ui_callback(msg_log=f"[SYSTEM] Touchdown confirmed (0.0m). Motors Disarmed.", log_type="system")
@@ -356,70 +485,121 @@ class UAVDataBridge:
         )
 
     def fly_to_waypoint(self, lat, lon):
-        if not self.vehicle or self.is_compromised: return
+        if not self.vehicle:
+            self.ui_callback(msg_log="[ERROR] Cannot fly: UAV not connected.", log_type="alert")
+            return
+        if self.is_compromised:
+            self.ui_callback(msg_log="[ERROR] Command ignored: System is in ZERO-TRUST LOCKDOWN.", log_type="alert")
+            return
         
         def _fly():
             self._command_cooldown = time.time() + 30  # Suppress false positives for 30s
             self.ui_callback(msg_log=f"[COMMAND] Target Coordinates Received: {lat:.5f}, {lon:.5f}", log_type="system")
             time.sleep(0.5)
             self.ui_callback(msg_log=f"[SYSTEM] Calculating optimal vector path...", log_type="system")
-            
-            current_alt = float(getattr(self, 'current_gps_alt', 0)) / 1000.0
-            if self.home_alt is not None:
-                current_alt = max(0.0, current_alt - self.home_alt)
-                
-            # 1. If on the ground, we MUST takeoff first
-            if current_alt < 2.0:
-                self.ui_callback(msg_log=f"[SYSTEM] Drone grounded. Auto-Takeoff sequence required.", log_type="system")
+
+            # Use RELATIVE altitude (above home) to decide if grounded
+            home = self.home_alt if self.home_alt is not None else self.vfr_alt
+            rel_alt = max(0.0, self.vfr_alt - home)
+
+            # 1. If on the ground, we MUST arm and takeoff first
+            if rel_alt < 2.0:
+                self.ui_callback(msg_log=f"[SYSTEM] Drone grounded (rel alt={rel_alt:.1f}m). Auto-Takeoff sequence starting...", log_type="system")
+
+                # Wait for GPS fix
                 self.ui_callback(msg_log=f"[SYSTEM] Waiting for GPS 3D Fix...", log_type="system")
                 for _ in range(60):
                     if hasattr(self, 'current_gps_lat') and self.current_gps_lat != 0:
                         break
                     time.sleep(1.0)
-                    
+
+                # Disable arming checks
                 self.vehicle.mav.param_set_send(
                     self.vehicle.target_system, self.vehicle.target_component,
                     b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
                 )
                 time.sleep(0.5)
-                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
-                time.sleep(2.0)
-                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
-                time.sleep(3.0)
-                self.vehicle.mav.command_long_send(self.vehicle.target_system, self.vehicle.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, float(self.target_alt))
-                
-                # Wait until drone actually gets into the air (at least 3 meters)
-                self.ui_callback(msg_log=f"[SYSTEM] Climbing to safe altitude ({self.target_alt}m)...", log_type="system")
-                for _ in range(20): # Max wait 20 seconds
-                    if self.vfr_alt - self.home_alt >= 3.0:
-                        break
+
+                # Anchor home alt before arming so relative calculations are correct
+                self.home_alt = self.vfr_alt
+
+                # Set GUIDED mode
+                self.ui_callback(msg_log=f"[SYSTEM] Setting GUIDED Mode...", log_type="system")
+                for _ in range(15):
+                    self.vehicle.mav.command_long_send(
+                        self.vehicle.target_system, self.vehicle.target_component,
+                        mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0
+                    )
                     time.sleep(1.0)
-            else:
-                # Already flying, just make sure we are in GUIDED mode
+                    if getattr(self, 'current_flight_mode', 0) == 4:
+                        self.ui_callback(msg_log=f"[SYSTEM] GUIDED mode confirmed.", log_type="system")
+                        break
+
+                # Arm motors
+                self.ui_callback(msg_log=f"[SYSTEM] Arming Motors...", log_type="system")
+                for _ in range(15):
+                    self.vehicle.mav.command_long_send(
+                        self.vehicle.target_system, self.vehicle.target_component,
+                        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
+                    )
+                    time.sleep(1.0)
+                    if getattr(self, 'is_armed', False):
+                        self.ui_callback(msg_log=f"[SYSTEM] Motors Armed ✓", log_type="system")
+                        break
+
+                if not getattr(self, 'is_armed', False):
+                    self.ui_callback(msg_log=f"[ERROR] Could not arm motors. Aborting flight.", log_type="alert")
+                    return
+
+                # Issue takeoff command
+                self.ui_callback(msg_log=f"[SYSTEM] Taking Off — target altitude {self.target_alt}m...", log_type="system")
                 self.vehicle.mav.command_long_send(
                     self.vehicle.target_system, self.vehicle.target_component,
-                    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+                    0, 0, 0, 0, 0, 0, float(self.target_alt)
                 )
-                time.sleep(0.5)
-            
-            # 2. Command Drone to fly to Coordinate
-            self.ui_callback(msg_log=f"[SYSTEM] Route Locked.", log_type="system")
-            time.sleep(0.5)
-            self.ui_callback(msg_log=f"[SYSTEM] Altitude Safe. Engaging forward thrusters...", log_type="system")
+
+                # Wait until we reach at least 3m RELATIVE altitude
+                self.ui_callback(msg_log=f"[SYSTEM] Climbing... (waiting for 3m relative alt)", log_type="system")
+                for _ in range(30):
+                    rel = self.vfr_alt - self.home_alt
+                    if rel >= 3.0:
+                        self.ui_callback(msg_log=f"[SYSTEM] Airborne — rel alt {rel:.1f}m ✓", log_type="system")
+                        break
+                    time.sleep(1.0)
+                else:
+                    self.ui_callback(msg_log=f"[WARNING] Takeoff altitude not confirmed, proceeding anyway.", log_type="system")
+
+            else:
+                # Already flying — ensure GUIDED mode is active
+                self.ui_callback(msg_log=f"[SYSTEM] Already airborne (rel alt={rel_alt:.1f}m). Switching to GUIDED...", log_type="system")
+                for _ in range(10):
+                    if getattr(self, 'current_flight_mode', 0) == 4:
+                        self.ui_callback(msg_log=f"[SYSTEM] GUIDED mode already active.", log_type="system")
+                        break
+                    self.vehicle.mav.command_long_send(
+                        self.vehicle.target_system, self.vehicle.target_component,
+                        mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0
+                    )
+                    time.sleep(0.5)
+
+            # 2. Send position target to fly to the selected coordinate
+            self.ui_callback(msg_log=f"[SYSTEM] Route Locked — sending waypoint to autopilot...", log_type="system")
+            time.sleep(0.3)
             self.vehicle.mav.set_position_target_global_int_send(
-                0, # time_boot_ms
+                0,                                                  # time_boot_ms
                 self.vehicle.target_system, self.vehicle.target_component,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                0b0000111111111000, # type_mask (only use position)
+                0b0000111111111000,                                 # type_mask (position only)
                 int(lat * 1e7),
                 int(lon * 1e7),
-                float(self.target_alt), # Use dynamic target altitude
+                float(self.target_alt),
                 0, 0, 0, 0, 0, 0, 0, 0
             )
-            time.sleep(0.5)
-            self.ui_callback(msg_log=f"[SYSTEM] En route to target at {self.target_speed} m/s.", log_type="system")
-            
+            self.ui_callback(msg_log=f"[SYSTEM] ✈ En route → ({lat:.5f}, {lon:.5f}) at {self.target_alt}m, {self.target_speed} m/s.", log_type="system")
+
         threading.Thread(target=_fly, daemon=True).start()
 
 class CyberDefenseApp(ctk.CTk):

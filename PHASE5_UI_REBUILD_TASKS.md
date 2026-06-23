@@ -22,15 +22,15 @@
 
 ---
 
-## 🔲 TASK 0 — Project Setup & Dependencies
+## ✅ TASK 0 — Project Setup & Dependencies
 **Goal:** Install PyQt5 stack and scaffold new file structure.
 
-- [ ] **T0.1** Install PyQt5 packages
+- [x] **T0.1** Install PyQt5 packages
   ```
   pip install PyQt5 PyQtWebEngine folium reportlab fpdf2
   ```
-- [ ] **T0.2** Create new file: `dashboard_pyqt.py` (do NOT delete `desktop_app.py` yet)
-- [ ] **T0.3** Create `ui/` folder for page modules:
+- [x] **T0.2** Create new file: `dashboard_pyqt.py` (do NOT delete `desktop_app.py` yet)
+- [x] **T0.3** Create `ui/` folder for page modules:
   - `ui/page_dashboard.py`
   - `ui/page_telemetry.py`
   - `ui/page_ai_detection.py`
@@ -38,12 +38,12 @@
   - `ui/page_threat_logs.py`
   - `ui/page_reports.py`
   - `ui/page_settings.py`
-- [ ] **T0.4** Create `assets/` folder for icons, map HTML template
-- [ ] **T0.5** Update `.gitignore` to exclude `__pycache__/`, `*.pyc`
+- [x] **T0.4** Create `assets/` folder for icons, map HTML template
+- [x] **T0.5** Update `.gitignore` to exclude `__pycache__/`, `*.pyc`
 
 ---
 
-## 🔲 TASK 1 — Main Window Shell + Sidebar
+## ✅ TASK 1 — Main Window Shell + Sidebar
 **File:** `dashboard_pyqt.py`
 **Goal:** Build the outer shell — top header bar, left sidebar, right content area.
 
@@ -87,7 +87,7 @@
 
 ---
 
-## 🔲 TASK 2 — Dashboard Page (Main Threat View)
+## ✅ TASK 2 — Dashboard Page (Main Threat View)
 **File:** `ui/page_dashboard.py`
 **Class:** `DashboardPage(QWidget)`
 **Goal:** Replicate the main dashboard exactly as shown in design image.
@@ -166,7 +166,7 @@
 
 ---
 
-## 🔲 TASK 3 — Live Telemetry Page
+## ✅ TASK 3 — Live Telemetry Page
 **File:** `ui/page_telemetry.py`
 **Class:** `TelemetryPage(QWidget)`
 **Goal:** Show all raw MAVLink values in real-time with graphs.
@@ -198,7 +198,7 @@
 
 ---
 
-## 🔲 TASK 4 — AI Detection Page
+## ✅ TASK 4 — AI Detection Page
 **File:** `ui/page_ai_detection.py`
 **Class:** `AIDetectionPage(QWidget)`
 
@@ -258,7 +258,7 @@
 
 ---
 
-## 🔲 TASK 5 — Live Map Page
+## ✅ TASK 5 — Live Map Page
 **File:** `ui/page_live_map.py`
 **Class:** `LiveMapPage(QWidget)`
 
@@ -298,7 +298,7 @@
 
 ---
 
-## 🔲 TASK 6 — Threat Logs Page
+## ✅ TASK 6 — Threat Logs Page
 **File:** `ui/page_threat_logs.py`
 **Class:** `ThreatLogsPage(QWidget)`
 
@@ -342,7 +342,7 @@
 
 ---
 
-## 🔲 TASK 7 — Reports Page
+## ✅ TASK 7 — Reports Page
 **File:** `ui/page_reports.py`
 **Class:** `ReportsPage(QWidget)`
 
@@ -382,7 +382,7 @@
 
 ---
 
-## 🔲 TASK 8 — Settings Page
+## ✅ TASK 8 — Settings Page
 **File:** `ui/page_settings.py`
 **Class:** `SettingsPage(QWidget)`
 
@@ -404,7 +404,7 @@
 
 ---
 
-## 🔲 TASK 9 — Backend Bridge Upgrades
+## ✅ TASK 9 — Backend Bridge Upgrades
 **File:** `desktop_app.py` (existing `UAVDataBridge`)
 **Goal:** Small additions to support new UI — no breaking changes.
 
@@ -439,7 +439,7 @@ self.last_pred_class = pred_class
 
 ---
 
-## 🔲 TASK 10 — Theming & Polish
+## ✅ TASK 10 — Theming & Polish
 **File:** `ui/theme.py`
 **Goal:** Consistent dark military theme across all pages using QSS.
 

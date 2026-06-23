@@ -5,7 +5,7 @@ Follow these steps in order to launch the simulator, the AI dashboard, and test 
 ## Step 1: Start the ArduPilot Simulator (SITL)
 Open a new terminal and run:
 ```bash
-cd ~/ardupilot/ArduCopter && ../Tools/autotest/sim_vehicle.py -v ArduCopter -f quad --console --map
+cd ~/ardupilot/ArduCopter && ../Tools/autotest/sim_vehicle.py -v ArduCopter -f quad --console --map --out 127.0.0.1:14551
 ```
 *Wait for the console to show "EKF2 is using GPS" before proceeding.*
 
@@ -15,7 +15,7 @@ cd ~/ardupilot/ArduCopter && ../Tools/autotest/sim_vehicle.py -v ArduCopter -f q
 Open a second terminal and run:
 ```bash
 cd "/home/thigan/Desktop/FYP PROJECT"
-./venv/bin/python3 desktop_app.py
+./venv/bin/python3 dashboard_pyqt.py
 ```
 *The dashboard will connect to the simulator on UDP port 14550.*
 
@@ -27,25 +27,25 @@ Open a third terminal and run any of the following commands to test the AI's det
 ### 1. RC Hijack / Override
 ```bash
 cd "/home/thigan/Desktop/FYP PROJECT"
-./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14550 --attack rc_override
+./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14551 --attack rc_override
 ```
 
 ### 2. GPS Spoofing
 ```bash
 cd "/home/thigan/Desktop/FYP PROJECT"
-./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14550 --attack gps_spoof
+./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14551 --attack gps_spoof
 ```
 
 ### 3. Mode Forcing (LAND/RTL)
 ```bash
 cd "/home/thigan/Desktop/FYP PROJECT"
-./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14550 --attack mode_change
+./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14551 --attack mode_change
 ```
 
 ### 4. Mid-Air Disarm
 ```bash
 cd "/home/thigan/Desktop/FYP PROJECT"
-./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14550 --attack disarm
+./venv/bin/python3 simulate_attack.py --connect udp:127.0.0.1:14551 --attack disarm
 ```
 
 ---
